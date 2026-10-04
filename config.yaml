@@ -1,0 +1,118 @@
+# MarketAlert configuration. All tunable values live here (AGENTS.md Section 2.6).
+# Times are IST (Asia/Kolkata), always quoted "HH:MM".
+# Prices, zones, gaps and buffers are in spot-index points.
+
+timezone: Asia/Kolkata
+utc_offset_minutes: 330          # IST = UTC+05:30, used to compute IST explicitly
+
+# --- Indices (Section 5) ----------------------------------------------------
+# expiry_rule is informational only: expiry is always taken from the instrument master.
+indices:
+  NIFTY:
+    spot_symbol: "Nifty 50"
+    spot_exchange: NSE
+    option_name: NIFTY
+    option_exchange: NFO
+    expiry_rule: "weekly, Tuesday"
+    strike_step: 50
+    zone: 10
+    reset_gap: 30
+    breakout_buffer: 5
+  BANKNIFTY:
+    spot_symbol: "Nifty Bank"
+    spot_exchange: NSE
+    option_name: BANKNIFTY
+    option_exchange: NFO
+    expiry_rule: "monthly, last Tuesday"
+    strike_step: 100
+    zone: 25
+    reset_gap: 75
+    breakout_buffer: 15
+  SENSEX:
+    spot_symbol: "SENSEX"
+    spot_exchange: BSE
+    option_name: SENSEX
+    option_exchange: BFO
+    expiry_rule: "weekly, Thursday"
+    strike_step: 100
+    zone: 25
+    reset_gap: 75
+    breakout_buffer: 15
+
+# --- Instruments --------------------------------------------------------------
+instruments:
+  master_url: "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+  download_timeout_seconds: 60
+  strike_divisor: 100            # master stores strike * 100
+
+# --- OI / walls (Sections 5, 6, 7) ---------------------------------------------
+oi:
+  oi_poll_seconds: 180
+  strikes_each_side: 15          # ATM +/- N strikes; outermost strike can never be a wall
+  quote_batch_size: 50           # max tokens per market-data request
+  shift_confirm_polls: 2         # WALL_SHIFT needs new main strike on N consecutive polls
+  oi_change_pct: 10
+  oi_change_window_minutes: 30
+  oi_baseline_not_before: "09:30"
+  expiry_day_sum_next: true      # expiry day: current + next expiry summed per strike
+  banknifty_monthly_sum_sessions: 3   # last N sessions before monthly expiry also sum next
+
+# --- Live data (Section 6) -----------------------------------------------------
+data:
+  ws_fallback_after_seconds: 30  # switch to REST LTP if websocket down longer than this
+  rest_ltp_poll_seconds: 5
+
+# --- Candles / EMA (Section 6) -------------------------------------------------
+candles:
+  breakout_timeframe_minutes: 5
+  ema_timeframe_minutes: 15
+ema:
+  periods: [50, 200]
+  seed_trading_days: 12
+
+# --- Alerts (Section 8) --------------------------------------------------------
+# Per-index zone / reset_gap / breakout_buffer are under indices.
+alerts:
+  window_start: "09:45"
+  window_end: "14:45"
+  max_alerts_per_index: 40
+  breakout_failed_candles: 3     # 5-min closes back inside within N candles
+
+# --- Schedule (Section 9) ------------------------------------------------------
+schedule:
+  start: "09:00"                 # login, instruments, EMA seed, websocket, health ping
+  market_open: "09:15"
+  holiday_check: "09:20"         # no ticks by then -> treat as holiday
+  market_map: "09:45"
+  alerts_end: "14:45"
+  market_close: "15:30"
+  summary: "15:45"
+  skip_weekends: true
+  holidays_file: holidays.yaml
+
+# --- Telegram (Section 10) -----------------------------------------------------
+telegram:
+  api_base: "https://api.telegram.org"
+  poll_seconds: 5
+  send_retries: 3
+
+# --- Network ---------------------------------------------------------------------
+network:
+  timeout_seconds: 10
+  retries: 3
+  backoff_seconds: 2
+
+# --- Paths -----------------------------------------------------------------------
+paths:
+  data_dir: data
+  logs_dir: logs
+  reports_dir: reports
+  state_file: data/state.json
+  recordings_dir: data/recordings
+
+# --- Probe (M0) ------------------------------------------------------------------
+probe:
+  max_total_seconds: 170
+  check_timeout_seconds: 60
+  ws_seconds: 20
+  history_calendar_days: 25      # fetch window; trimmed to the last seed_trading_days

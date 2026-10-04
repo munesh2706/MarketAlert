@@ -1,0 +1,1 @@
+"""EMA in pure Python."""

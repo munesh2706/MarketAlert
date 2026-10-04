@@ -1,0 +1,4 @@
+# Trading holidays (YYYY-MM-DD), one list per exchange.
+# Fill in every year from the official NSE / BSE holiday circulars.
+NSE: []
+BSE: []
