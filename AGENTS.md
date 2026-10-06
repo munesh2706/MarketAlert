@@ -110,6 +110,7 @@ reports/
 
 ## 9. Schedule (config `schedule:`)
 
+- 08:50 instrument refresh (subprocess, §14).
 - 09:00 start: login, load instruments, seed EMAs, start WebSocket, Telegram health ping.
 - 09:00–09:45: track silently (walls, candles, OI history).
 - 09:45: market map per index (spot, main/2nd walls and floors with OI, PCR, EMA50/EMA200, expiry).
@@ -191,3 +192,8 @@ Measured 2026-10-06 (PC and phone/Termux). Values live in `config.yaml`.
   connections, REST LTP every 5 s after 30 s of silence, back to websocket when ticks resume, and a
   forced reconnect if the socket is silent 60 s during market hours.
 - SENSEX ticks are sparser (~1 per 1–3 s) than NSE indices; fine for 5/15-min candles.
+- M2 runtime: OI polls run in a worker thread and reach the engine through a queue, so tick
+  processing and alerts never pause. Holiday check counts only websocket ticks or REST prices that
+  actually move (REST LTP on a holiday returns the stale close). A day counts as a holiday only if
+  every tracked exchange lists it. BREAKOUT re-arms when price is back ≥ reset gap on the other
+  side of the level. Alerts suppressed by mute/cap do not disarm.

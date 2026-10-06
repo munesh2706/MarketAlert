@@ -118,6 +118,26 @@ class OiHistory:
                 best = (ts, snap)
         return best
 
+    def first(self) -> tuple[datetime, Snapshot] | None:
+        """First snapshot of the day at/after not_before."""
+        return next(((t, s) for t, s in self.snaps if t.time() >= self.not_before), None)
+
+    def day_changes(self, top: int) -> list[dict[str, Any]]:
+        """Largest absolute OI changes per strike/side from first() to the latest snapshot."""
+        base = self.first()
+        if not base or not self.snaps:
+            return []
+        cur = self.snaps[-1][1]
+        rows = []
+        for strike, sides in cur.items():
+            for side in ("CE", "PE"):
+                b = (base[1].get(strike) or {}).get(side) or 0
+                c = sides.get(side) or 0
+                if c != b:
+                    rows.append({"strike": strike, "side": side, "base": b, "cur": c, "change": c - b,
+                                 "pct": round((c - b) / b * 100, 1) if b else None})
+        return sorted(rows, key=lambda r: -abs(r["change"]))[:top]
+
     def oi_change_pct(self, strike: float, side: str, now: datetime) -> float | None:
         """% change of OI at strike/side from the baseline to the latest snapshot <= now."""
         base = self.baseline(now)

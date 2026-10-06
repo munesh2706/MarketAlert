@@ -17,6 +17,8 @@ class IndexState:
         self.key = key
         sch, oi, cnd = cfg["schedule"], cfg["oi"], cfg["candles"]
         self.ema_tf = cnd["ema_timeframe_minutes"]
+        self.open_t, self.close_t = parse_hhmm(sch["market_open"]), parse_hhmm(sch["market_close"])
+        self.ohlc: dict[str, Any] = {}          # day O/H/L/C from in-session ticks
         tfs = sorted({1, cnd["breakout_timeframe_minutes"], self.ema_tf})
         self.candles = CandleSet(tfs, parse_hhmm(sch["market_open"]), parse_hhmm(sch["market_close"]))
         self.emas = EmaSet(cfg["ema"]["periods"])
@@ -45,6 +47,12 @@ class IndexState:
 
     def on_tick(self, ts: datetime, price: float) -> list[dict[str, Any]]:
         self.spot, self.last_tick = price, ts
+        if self.open_t <= ts.time() < self.close_t:
+            o = self.ohlc
+            if o.get("date") != ts.date():
+                self.ohlc = {"date": ts.date(), "open": price, "high": price, "low": price, "close": price}
+            else:
+                o["high"], o["low"], o["close"] = max(o["high"], price), min(o["low"], price), price
         return self._on_candles(self.candles.on_tick(ts, price))
 
     def advance(self, now: datetime) -> list[dict[str, Any]]:

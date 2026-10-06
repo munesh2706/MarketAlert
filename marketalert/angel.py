@@ -334,6 +334,8 @@ class LiveFeed:
         self.fallback = False
         self.reconnects = self.fallbacks = self.ws_ticks = self.rest_ticks = 0
         self.fail_streak = 0
+        self.rest_changes = 0                   # REST prices that moved (stale LTP != live data)
+        self._rest_last: dict[str, float] = {}
 
     def start(self) -> None:
         self.started = self.clock()
@@ -402,6 +404,9 @@ class LiveFeed:
                 for tok, price in self.rest_ltp().items():
                     if tok in self.tokens:
                         self.rest_ticks += 1
+                        if tok in self._rest_last and self._rest_last[tok] != price:
+                            self.rest_changes += 1
+                        self._rest_last[tok] = price
                         self.on_tick(self.tokens[tok], now, price, "rest")
             except Exception as e:  # noqa: BLE001
                 log.warning("REST LTP fallback failed: %s", e)
@@ -411,6 +416,10 @@ class LiveFeed:
             self.last_force = now
             log.warning("websocket silent %.0fs; forcing reconnect", silent)
             self.sock.close()
+
+    def has_live_data(self) -> bool:
+        """True once websocket ticks arrived or REST prices moved (a holiday shows neither)."""
+        return self.ws_ticks > 0 or self.rest_changes > 0
 
     def stats(self) -> dict[str, Any]:
         return {"reconnects": self.reconnects, "fallbacks": self.fallbacks, "fallback_now": self.fallback,

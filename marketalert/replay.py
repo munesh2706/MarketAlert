@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from .alerts import AlertEngine, AlertState
 from .config import IST
 from .engine import Engine, timeline_line
 
@@ -44,19 +45,34 @@ def load_day(day_dir: Path, indices: list[str]) -> tuple[list[tuple], dict[str, 
 
 
 def replay_day(cfg: dict[str, Any], day_dir: Path, indices: list[str] | None = None,
-               out: Callable[[str], None] = print) -> dict[str, Any]:
-    """Feed a recorded day through the engine; print the timeline; return a summary."""
+               out: Callable[[str], None] = print, alerts: bool = True,
+               on_alert: Callable[[Any], None] | None = None) -> dict[str, Any]:
+    """Feed a recorded day through the engine (and alert rules) with a simulated clock.
+
+    Prints the timeline, confirmed shifts and alerts; returns a summary with alert counts."""
     indices = indices or list(cfg["indices"])
     events, seeds = load_day(Path(day_dir), indices)
     engine = Engine(cfg, indices)
+    day = events[0][0].date() if events else None
+    rules = AlertEngine(cfg, AlertState(None, day)) if alerts and day else None
     for idx, candles in seeds.items():
         ok = engine.states[idx].seed_emas(candles)
         out(f"{idx}: EMA seeded from {len(candles)} recorded candles" if ok
             else f"{idx}: EMA seed failed ({len(candles)} candles) -> EMA None")
     tl = cfg["replay"]["timeline_minutes"]
-    summary: dict[str, Any] = {"ticks": 0, "oi": 0, "shifts": [], "timeline": []}
+    summary: dict[str, Any] = {"ticks": 0, "oi": 0, "shifts": [], "timeline": [], "alerts": [],
+                               "alert_counts": {}}
 
-    def handle(evs: list[dict[str, Any]]) -> None:
+    def handle(evs: list[dict[str, Any]], now: datetime | None = None, index: str | None = None) -> None:
+        if rules and now is not None:
+            keys = {e["index"] for e in evs} | ({index} if index else set())
+            for k in sorted(keys):
+                for a in rules.process(engine.states[k], [e for e in evs if e["index"] == k], now):
+                    summary["alerts"].append(a)
+                    summary["alert_counts"][a.type] = summary["alert_counts"].get(a.type, 0) + 1
+                    out(f"{a.ts:%H:%M:%S} [{a.type}] {a.text}")
+                    if on_alert:
+                        on_alert(a)
         for ev in evs:
             if ev["type"] == "shift":
                 line = f"{ev['ts']:%H:%M} {ev['index']:<9} SHIFT {ev['side']} {ev['old']:g} -> {ev['new']:g}"
@@ -68,15 +84,16 @@ def replay_day(cfg: dict[str, Any], day_dir: Path, indices: list[str] | None = N
                 out(line)
 
     for ts, _o, kind, idx, payload in events:
-        handle(engine.advance(ts))
+        handle(engine.advance(ts), ts)
         if kind == "tick":
             summary["ticks"] += 1
-            handle(engine.on_tick(idx, ts, payload))
+            handle(engine.on_tick(idx, ts, payload), ts, idx)
         else:
             summary["oi"] += 1
             spot, snap = payload
-            handle(engine.on_oi(idx, ts, snap, spot))
+            handle(engine.on_oi(idx, ts, snap, spot), ts, idx)
     if events:   # close the candle forming at the end of the recording (no flat fill beyond it)
-        handle(engine.advance(events[-1][0] + timedelta(minutes=tl)))
+        end = events[-1][0] + timedelta(minutes=tl)
+        handle(engine.advance(end), end)
     summary["engine"] = engine
     return summary

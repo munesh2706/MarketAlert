@@ -118,24 +118,36 @@ alerts:
   window_end: "14:45"
   max_alerts_per_index: 40
   breakout_failed_candles: 3     # 5-min closes back inside within N candles
+  oi_change_rearm_minutes: 30    # OI_CHANGE: once per level per N minutes
+  summary_top_oi_changes: 3      # largest OI changes listed in the 15:45 summary
 
 # --- Schedule (Section 9) ------------------------------------------------------
 schedule:
+  refresh: "08:50"               # instrument refresh (subprocess)
   start: "09:00"                 # login, instruments, EMA seed, websocket, health ping
   market_open: "09:15"
   holiday_check: "09:20"         # no ticks by then -> treat as holiday
+  holiday_check_grace_seconds: 120   # started late: wait this long after feed start first
   market_map: "09:45"
   alerts_end: "14:45"
   market_close: "15:30"
   summary: "15:45"
   skip_weekends: true
   holidays_file: holidays.yaml
+  error_restart_seconds: 60      # unexpected exception -> log, report once, restart after N s
+  sleep_chunk_seconds: 60        # long sleeps re-check the clock this often
+  loop_seconds: 1                # main loop period during the trading day
 
 # --- Telegram (Section 10) -----------------------------------------------------
 telegram:
   api_base: "https://api.telegram.org"
-  poll_seconds: 5
+  long_poll_seconds: 25          # getUpdates long-poll timeout
+  request_timeout_seconds: 35    # HTTP timeout (> long poll)
   send_retries: 3
+  send_backoff_seconds: [2, 5, 10]
+  min_send_interval_seconds: 1   # send queue: at most 1 message per second
+  max_message_chars: 4000
+  poll_error_backoff_seconds: 10
 
 # --- Network ---------------------------------------------------------------------
 network:
