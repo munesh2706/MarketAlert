@@ -47,12 +47,13 @@ marketalert/
   candles.py       # build 1/5/15-min candles from ticks
   indicators.py    # EMA (pure python)
   walls.py         # OI snapshot, walls/floors, shift confirmation, OI change
+  engine.py        # IndexState/Engine: on_tick, on_oi; same core live and in replay
   alerts.py        # alert rules, zones, arm/re-arm state, cooldowns, caps
   telegram.py      # send messages, command polling (/map /mute /status /help)
   scheduler.py     # daily timeline, holidays
   recorder.py      # save live ticks + OI snapshots to data/recordings/
   replay.py        # run the engine on recorded days, print alerts
-scripts/           # probe_angel.py, run.py, replay.py
+scripts/           # probe_angel.py, run.py, replay.py, refresh_instruments.py
 tests/
 data/              # gitignored: instrument cache, recordings, state.json
 logs/              # gitignored
@@ -162,6 +163,9 @@ Measured 2026-10-06 (PC and phone/Termux). Values live in `config.yaml`.
   streaming parse into `data/instruments_filtered.json`) must tolerate up to 5 min
   (`instruments.refresh_timeout_seconds`) and must **run as a separate short-lived process**,
   never inside the long-running bot process. The bot only reads the filtered file.
+  If the file is not from today the bot runs `scripts/refresh_instruments.py` as a subprocess;
+  on failure it uses the old file if every index's nearest expiry is still ≥ today, else logs an
+  alert and retries every `instruments.refresh_retry_minutes` (2).
 - Spot index tokens are fixed in config (`indices.*.spot_token`); history and websocket never
   depend on the instrument master.
 - Option instruments: strike = master `strike` / 100, expiry = master `expiry`. Never parse
@@ -170,10 +174,20 @@ Measured 2026-10-06 (PC and phone/Termux). Values live in `config.yaml`.
   symbol's last two characters are the only allowed symbol use, validated as `CE`/`PE`
   (`instruments.option_type`); rows that fail are dropped and counted.
 - Historical candles are rate limited (hit on PC at 0.4 s spacing and on phone). Seed indices
-  **sequentially**, ≥ 1.5 s apart, retry up to 3 times with backoff. If an index still fails, start
-  without its EMA (no EMA alerts for it), log it, and retry seeding every 5 min. Never crash.
+  **sequentially**, ≥ 3 s apart (`history.spacing_seconds`), retry up to 4 times with backoff
+  5/10/20/40 s. If an index still fails, start without its EMA (EMA = None, no EMA alerts for it),
+  log it, and retry seeding every 5 min (`history.reseed_minutes`). Never crash.
+- Rate limiting is detected by the text "exceeding access rate" (`angel.rate_limit_text`) on
+  **all** Angel REST calls (history, quotes, LTP), in exceptions and in JSON replies, and gets the
+  same backoff. Session errors trigger one re-login per call.
+- Seeded 15-min history is cached in `data/history_15m_{INDEX}.json` (with date). A same-day
+  restart loads the cache and fetches only missing completed candles; the forming candle is never
+  stored.
 - WebSocket: one reconnect attempt was logged on PC and the feed recovered. Keep auto-reconnect and
   log reconnect counts. The SDK's internal retry is bounded and its counter never resets, so the
   bot needs its own outer reconnect loop with backoff (`websocket:` config) on top of the REST
-  fallback from Section 6.
+  fallback from Section 6. Implemented (M1): SDK retries off, unlimited reconnects with backoff
+  5 s doubling to 60 s (reset after a connection that delivered ticks), re-login after 3 tick-less
+  connections, REST LTP every 5 s after 30 s of silence, back to websocket when ticks resume, and a
+  forced reconnect if the socket is silent 60 s during market hours.
 - SENSEX ticks are sparser (~1 per 1–3 s) than NSE indices; fine for 5/15-min candles.

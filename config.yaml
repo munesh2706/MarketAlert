@@ -52,6 +52,8 @@ instruments:
   filtered_file: data/instruments_filtered.json
   strike_divisor: 100            # master stores strike * 100
   refresh_timeout_seconds: 300   # phone download+parse; runs as a separate short-lived process
+  refresh_script: scripts/refresh_instruments.py
+  refresh_retry_minutes: 2       # no usable instruments -> retry refresh this often
 
 # --- OI / walls (Sections 5, 6, 7) ---------------------------------------------
 oi:
@@ -72,19 +74,34 @@ data:
 
 # --- Historical candles (probe: rate limit hit on PC at 0.4 s and on phone) -------
 # Indices are seeded sequentially. An index that still fails starts without its EMA
-# and is re-seeded every seed_retry_minutes (logged, never crashes).
+# and is re-seeded every reseed_minutes (logged, never crashes).
 history:
-  request_gap_seconds: 1.5       # minimum gap between historical calls
-  retries: 3                     # retries after a rate-limit error
-  retry_backoff_seconds: 2.0     # doubled on each retry (2, 4, 8 s)
-  seed_retry_minutes: 5
+  spacing_seconds: 3             # minimum gap between historical calls
+  retries: 4                     # retries after a rate-limit error
+  backoff_seconds: [5, 10, 20, 40]   # rate-limit backoff, used for ALL Angel REST calls
+  reseed_minutes: 5
+  calendar_days: 25              # full fetch window; trimmed to ema.seed_trading_days
+  cache_file: "data/history_15m_{index}.json"   # same-day restart fetches only missing candles
+
+# --- Angel REST ----------------------------------------------------------------------
+angel:
+  rate_limit_text: "exceeding access rate"   # detected on every REST call (history, quotes, LTP)
+  quote_spacing_seconds: 0.2     # gap between market-data batches
+  network_retries: 3             # retries on timeouts / connection errors
+  network_backoff_seconds: 2
+  login_retry_seconds: 60        # live session: keep retrying login this often
+  session_error_codes: [AG8001, AG8002, AG8003, AB1010, AB1011, AB8050, AB8051]
+  session_error_text: ["Invalid Token", "Token Expired", "TokenException", "Session Expired"]
 
 # --- WebSocket ---------------------------------------------------------------------
 websocket:
-  sdk_max_retry_attempts: 3      # SmartWebSocketV2 internal retries (counter never resets)
+  sdk_max_retry_attempts: 0      # SDK internal retry off; the bot runs its own reconnect loop
   sdk_retry_delay_seconds: 5
-  reconnect_backoff_seconds: 5   # bot's own outer reconnect loop
+  reconnect_backoff_seconds: 5   # doubles per failed attempt, unlimited attempts
   reconnect_backoff_max_seconds: 60
+  relogin_after_failures: 3      # consecutive tick-less connections before re-login
+  check_seconds: 1               # monitor loop period (fallback / candle clock)
+  stale_reconnect_seconds: 60    # market open + socket silent this long -> force reconnect
 
 # --- Candles / EMA (Section 6) -------------------------------------------------
 candles:
@@ -125,6 +142,17 @@ network:
   timeout_seconds: 10
   retries: 3
   backoff_seconds: 2
+
+# --- Logging -------------------------------------------------------------------------
+logging:
+  file: logs/marketalert.log
+  max_bytes: 1000000
+  backups: 3
+  level: INFO
+
+# --- Replay ---------------------------------------------------------------------------
+replay:
+  timeline_minutes: 15           # print wall/floor/EMA timeline every N minutes
 
 # --- Paths -----------------------------------------------------------------------
 paths:

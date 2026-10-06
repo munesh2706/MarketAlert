@@ -143,3 +143,142 @@ def select_atm_options(options: list[dict[str, Any]], spot: float, step: float,
     chosen = set(sel)
     return {"rows": [o for o in near if o["strike"] in chosen], "strikes": sel,
             "atm": atm, "expiry": exps[0]}
+
+
+# ---------------------------------------------------------------- bot side
+def load_holidays(path: Path) -> dict[str, set[date]]:
+    """Load holidays.yaml -> {exchange: {dates}} (accepts YAML dates or 'YYYY-MM-DD' strings)."""
+    import yaml
+
+    try:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except OSError:
+        return {}
+    return {str(ex): {d if isinstance(d, date) else date.fromisoformat(str(d)) for d in (days or [])}
+            for ex, days in raw.items()}
+
+
+def is_trading_day(d: date, holidays: set[date]) -> bool:
+    """Weekday and not a listed holiday."""
+    return d.weekday() < 5 and d not in holidays
+
+
+class Instruments:
+    """Bot-side view of data/instruments_filtered.json (never touches the full master)."""
+
+    def __init__(self, data: dict[str, Any], cfg: dict[str, Any],
+                 holidays: dict[str, set[date]] | None = None):
+        self.data = data
+        self.cfg = cfg
+        self.holidays = holidays or {}
+
+    @property
+    def built(self) -> str:
+        return self.data.get("date", "")
+
+    def spot_token(self, index: str) -> str:
+        """Fixed spot token from config (AGENTS.md §14)."""
+        return str(self.cfg["indices"][index]["spot_token"])
+
+    def expiries(self, index: str, on: date | None = None) -> list[date]:
+        """Sorted option expiries >= on (default: all in the file)."""
+        exps = [date.fromisoformat(e) for e in expiries(self.data["options"].get(index, []))]
+        return [e for e in exps if on is None or e >= on]
+
+    def option_tokens(self, index: str, expiry: date, atm: float, n: int) -> list[dict[str, Any]]:
+        """CE/PE rows {token, strike, type} of one expiry: listed strike nearest atm, +/- n."""
+        iso = expiry.isoformat()
+        rows = [o for o in self.data["options"].get(index, []) if o["expiry"] == iso]
+        strikes = sorted({o["strike"] for o in rows})
+        if not strikes:
+            return []
+        i = strikes.index(min(strikes, key=lambda s: abs(s - atm)))
+        keep = set(strikes[max(0, i - n): i + n + 1])
+        return [{"token": o["token"], "strike": o["strike"], "type": o["type"]}
+                for o in rows if o["strike"] in keep]
+
+    def is_expiry_day(self, index: str, d: date) -> bool:
+        """True if d is an option expiry of the index (from the master, never from weekdays)."""
+        return d in set(self.expiries(index))
+
+    def in_rollover(self, index: str, d: date, sessions: int) -> bool:
+        """True if d is one of the last `sessions` trading sessions up to and including the
+        index's nearest expiry (weekdays + holidays.yaml of the spot exchange)."""
+        exps = self.expiries(index, on=d)
+        hol = self.holidays.get(self.cfg["indices"][index]["spot_exchange"], set())
+        if not exps or not is_trading_day(d, hol):
+            return False
+        count, day = 0, d
+        while day <= exps[0]:
+            count += is_trading_day(day, hol)
+            day = date.fromordinal(day.toordinal() + 1)
+        return count <= sessions
+
+    def in_bnf_rollover(self, d: date) -> bool:
+        """BANKNIFTY: last N sessions up to and including the monthly expiry."""
+        return self.in_rollover("BANKNIFTY", d, self.cfg["oi"]["banknifty_monthly_sum_sessions"])
+
+    def oi_expiries(self, index: str, d: date) -> list[date]:
+        """Expiries whose OI is summed per strike on day d (current, plus next when required)."""
+        exps = self.expiries(index, on=d)
+        need_next = bool(exps) and self.cfg["oi"]["expiry_day_sum_next"] and exps[0] == d
+        if index == "BANKNIFTY" and self.in_bnf_rollover(d):
+            need_next = True
+        return exps[:2] if need_next else exps[:1]
+
+
+def ensure_instruments(cfg: dict[str, Any], root: Path, today: date,
+                       runner: Any = None, log: Any = None) -> Instruments | None:
+    """Return today's instruments, refreshing via a subprocess if the file is stale.
+
+    On refresh failure, fall back to the old file if every index's nearest expiry is still
+    >= today; otherwise return None (caller retries every refresh_retry_minutes).
+    """
+    import logging
+    import subprocess
+    import sys
+
+    log = log or logging.getLogger("marketalert")
+    icfg = cfg["instruments"]
+    path = root / icfg["filtered_file"]
+    holidays = load_holidays(root / cfg["schedule"]["holidays_file"])
+    data = load_filtered(path, today)
+    if data:
+        return Instruments(data, cfg, holidays)
+    cmd = [sys.executable, str(root / icfg["refresh_script"])]
+    log.info("instruments stale; running %s", icfg["refresh_script"])
+    try:
+        res = (runner or subprocess.run)(cmd, cwd=str(root), timeout=icfg["refresh_timeout_seconds"],
+                                         capture_output=True, text=True)
+        ok = res.returncode == 0
+        if not ok:
+            log.error("instrument refresh failed (rc=%s): %s", res.returncode,
+                      (res.stderr or res.stdout or "")[-300:])
+    except Exception as e:  # noqa: BLE001 - includes subprocess.TimeoutExpired
+        ok = False
+        log.error("instrument refresh error: %s", e)
+    data = load_filtered(path, today) if ok else None
+    if data:
+        return Instruments(data, cfg, holidays)
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        old = None
+    if old:
+        inst = Instruments(old, cfg, holidays)
+        if all(inst.expiries(k, on=today) for k in cfg["indices"]):
+            log.warning("using stale instruments from %s (nearest expiries still >= today)",
+                        old.get("date"))
+            return inst
+    log.error("ALERT: no usable instruments file; retrying in %s min", icfg["refresh_retry_minutes"])
+    return None
+
+
+def wait_for_instruments(cfg: dict[str, Any], root: Path, today_fn: Any, sleep: Any = time.sleep,
+                         stop: Any = None, runner: Any = None) -> Instruments | None:
+    """Retry ensure_instruments every refresh_retry_minutes until success or stop() is true."""
+    while True:
+        inst = ensure_instruments(cfg, root, today_fn(), runner=runner)
+        if inst or (stop and stop()):
+            return inst
+        sleep(cfg["instruments"]["refresh_retry_minutes"] * 60)

@@ -285,7 +285,6 @@ def p6_full_poll() -> dict[str, Any]:
 def get_candles(params: dict[str, str], key: str, out: dict[str, Any]) -> dict[str, Any]:
     """getCandleData with backoff retries on rate-limit errors (SDK raises on those replies)."""
     h = CFG["history"]
-    delay = h["retry_backoff_seconds"]
     for attempt in range(h["retries"] + 1):
         try:
             return STATE["api"].getCandleData(params)
@@ -293,8 +292,7 @@ def get_candles(params: dict[str, str], key: str, out: dict[str, Any]) -> dict[s
             if "access rate" not in str(e).lower() or attempt == h["retries"]:
                 raise
             out.setdefault("rate_limit_retries", []).append(key)
-            time.sleep(delay)
-            delay *= 2
+            time.sleep(h["backoff_seconds"][min(attempt, len(h["backoff_seconds"]) - 1)])
     raise RuntimeError("unreachable")
 
 
@@ -327,7 +325,7 @@ def p4_history() -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             out[k] = {"error": scrub(e)}
             ok = False
-        time.sleep(CFG["history"]["request_gap_seconds"])
+        time.sleep(CFG["history"]["spacing_seconds"])
     if not ok:
         out["_status"] = "PARTIAL"
     return out
@@ -402,7 +400,7 @@ def main() -> int:
     print(f"MarketAlert probe {started:%Y-%m-%d %H:%M:%S} IST (market open: {is_market_open(CFG)}, "
           f"cap {CFG['probe']['max_total_seconds']}s)")
     run_check("P1_login", p1_login, 30)
-    run_check("P4_history_15m", p4_history, 75)
+    run_check("P4_history_15m", p4_history, 120)
     run_check("P5_websocket", p5_websocket, CFG["probe"]["ws_seconds"] + 15)
     run_check("P2_instruments", p2_instruments, CFG["instruments"]["refresh_timeout_seconds"])
     run_check("P3_oi_quotes", p3_oi, 45)
