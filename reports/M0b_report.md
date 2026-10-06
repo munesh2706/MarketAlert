@@ -35,7 +35,8 @@ config.yaml, marketalert/instruments.py, scripts/probe_angel.py, reports/M0b_rep
 ## Problems
 - maxrss is unavailable on Windows (null); it will be reported on Termux.
 ## Next — user action needed
-On the phone (Termux):
+On the PC first (commit is not pushed yet): `git push`
+Then on the phone (Termux):
     cd ~/MarketAlert
     git pull
     python scripts/probe_angel.py
