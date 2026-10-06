@@ -1,18 +1,22 @@
-"""M0 Angel SmartAPI capability probe.
+"""M0 Angel SmartAPI capability probe (phone friendly).
 
 Runs checks P1..P6 (each independent, try/except + timeout), never prints secrets,
 writes reports/M0_probe.json. Total runtime is capped by probe.max_total_seconds.
+Spot tokens come from config (P4/P5 never depend on P2). P2 streams the scrip master
+to disk and writes data/instruments_filtered.json; P3/P6 read option tokens from it.
 
-Usage: python scripts/probe_angel.py
+Usage: python scripts/probe_angel.py [--force-download]
 """
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
 import sys
 import threading
 import time
-from datetime import date, timedelta
+import tracemalloc
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,16 +25,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from marketalert.config import (  # noqa: E402
     ROOT, is_market_open, load_config, load_env, missing_env, now_ist, today_ist,
 )
+from marketalert import instruments as ins  # noqa: E402
 
 ANGEL_KEYS = ("ANGEL_API_KEY", "ANGEL_CLIENT_CODE", "ANGEL_MPIN", "ANGEL_TOTP_SECRET")
-MONTHS = {m: i for i, m in enumerate(
-    ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"], 1)}
 WS_EXCHANGE_TYPE = {"NSE": 1, "NFO": 2, "BSE": 3, "BFO": 4}
 
 CFG = load_config()
+SPOT = {k: {"token": str(v["spot_token"]), "exchange": v["spot_exchange"]}
+        for k, v in CFG["indices"].items()}
 ENV: dict[str, str] = {}
 STATE: dict[str, Any] = {}      # shared results between checks (session, tokens, ...)
 RESULTS: dict[str, dict[str, Any]] = {}
+ARGS = argparse.Namespace(force_download=False)
 T0 = time.monotonic()
 
 
@@ -45,12 +51,14 @@ def scrub(text: Any) -> str:
     return s[:300]
 
 
-def parse_expiry(s: str) -> date | None:
-    """Parse master expiry like '07OCT2026' into a date (locale independent)."""
+def rss_peak_mb() -> float | None:
+    """Process peak RSS in MB via resource.getrusage (None where unavailable, e.g. Windows)."""
     try:
-        return date(int(s[5:9]), MONTHS[s[2:5].upper()], int(s[0:2]))
-    except (KeyError, ValueError, IndexError):
+        import resource
+    except ImportError:
         return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return round(peak / (1e6 if sys.platform == "darwin" else 1024), 1)
 
 
 def run_check(name: str, fn: Callable[[], dict[str, Any]], timeout: float | None = None) -> None:
@@ -71,6 +79,7 @@ def run_check(name: str, fn: Callable[[], dict[str, Any]], timeout: float | None
         except Exception as e:  # noqa: BLE001 - probe must never crash
             box["error"] = f"{type(e).__name__}: {scrub(e)}"
 
+    print(f"{name}: running (timeout {timeout:.0f}s)...", flush=True)
     t = time.monotonic()
     th = threading.Thread(target=target, daemon=True)
     th.start()
@@ -87,7 +96,7 @@ def run_check(name: str, fn: Callable[[], dict[str, Any]], timeout: float | None
         res = {"status": d.pop("_status", "PASS"), "details": d}
     res["seconds"] = secs
     RESULTS[name] = res
-    print(f"{name}: {res['status']} ({secs}s) {res.get('reason', '')}")
+    print(f"{name}: {res['status']} ({secs}s) {res.get('reason', '')}", flush=True)
 
 
 class SkipCheck(Exception):
@@ -131,122 +140,91 @@ def p1_login() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- P2
-def load_master() -> list[dict[str, Any]]:
-    import requests
-
-    data_dir = ROOT / CFG["paths"]["data_dir"]
-    data_dir.mkdir(exist_ok=True)
-    cache = data_dir / f"scrip_master_{today_ist().isoformat()}.json"
-    if not cache.exists():
-        r = requests.get(CFG["instruments"]["master_url"],
-                         timeout=CFG["instruments"]["download_timeout_seconds"])
-        r.raise_for_status()
-        tmp = cache.with_suffix(".tmp")
-        tmp.write_bytes(r.content)
-        tmp.replace(cache)
-        for old in data_dir.glob("scrip_master_*.json"):
-            if old != cache:
-                old.unlink()
-    with cache.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
 def p2_instruments() -> dict[str, Any]:
-    t = time.monotonic()
-    master = load_master()
-    load_s = round(time.monotonic() - t, 1)
-    indices = CFG["indices"]
-    div = CFG["instruments"]["strike_divisor"]
+    icfg = CFG["instruments"]
+    master = ROOT / icfg["master_file"]
+    filtered = ROOT / icfg["filtered_file"]
+    master.parent.mkdir(parents=True, exist_ok=True)
     today = today_ist()
+    out: dict[str, Any] = {}
 
-    spot: dict[str, dict[str, str]] = {}
-    opts: dict[str, list[dict[str, Any]]] = {k: [] for k in indices}
-    name_to_key = {(v["option_exchange"], v["option_name"]): k for k, v in indices.items()}
-    for row in master:
-        seg, itype = row.get("exch_seg"), row.get("instrumenttype")
-        if itype == "AMXIDX":
-            for k, v in indices.items():
-                if seg == v["spot_exchange"] and row.get("symbol", "").lower() == v["spot_symbol"].lower():
-                    spot[k] = {"token": row["token"], "symbol": row["symbol"], "exchange": seg}
-        elif itype == "OPTIDX":
-            k = name_to_key.get((seg, row.get("name")))
-            if k:
-                exp = parse_expiry(row.get("expiry", ""))
-                if exp and exp >= today:
-                    opts[k].append({"token": row["token"], "symbol": row["symbol"], "expiry": exp,
-                                    "strike": float(row["strike"]) / div,
-                                    "type": row["symbol"][-2:], "lotsize": row.get("lotsize")})
-    master_rows = len(master)
-    del master
-
-    # Filtered cache (small) for later phases / low-memory devices.
-    small = {"spot": spot, "options": {k: [dict(o, expiry=o["expiry"].isoformat()) for o in v]
-                                       for k, v in opts.items()}}
-    (ROOT / CFG["paths"]["data_dir"] / "instruments_filtered.json").write_text(json.dumps(small))
-
-    # ATM from current spot via REST LTP.
-    ltp: dict[str, float] = {}
-    ltp_err = None
-    if STATE.get("api") and spot:
-        try:
-            req: dict[str, list[str]] = {}
-            for s in spot.values():
-                req.setdefault(s["exchange"], []).append(s["token"])
-            data = market_data("LTP", req)
-            by_token = {f["symbolToken"]: float(f["ltp"]) for f in data.get("fetched", [])}
-            ltp = {k: by_token[s["token"]] for k, s in spot.items() if s["token"] in by_token}
-        except Exception as e:  # noqa: BLE001
-            ltp_err = scrub(e)
+    data = None if ARGS.force_download else ins.load_filtered(filtered, today)
+    if data:
+        out["cached"] = True
     else:
-        ltp_err = "no login session (P1 failed)"
+        out["cached"] = False
+        tracemalloc.start()
+        dl = ins.download_master(icfg["master_url"], master, icfg["download_timeout_seconds"],
+                                 icfg["download_chunk_bytes"])
+        out.update(download_seconds=dl["seconds"], master_file_mb=dl["mb"],
+                   download_peak_tracemalloc_mb=round(tracemalloc.get_traced_memory()[1] / 1e6, 1))
+        tracemalloc.reset_peak()
+        t = time.monotonic()
+        data = ins.build_filtered(master, CFG["indices"], icfg["strike_divisor"], today,
+                                  icfg["parse_chunk_chars"])
+        out["parse_seconds"] = round(time.monotonic() - t, 1)
+        out["parse_peak_tracemalloc_mb"] = round(tracemalloc.get_traced_memory()[1] / 1e6, 1)
+        tracemalloc.stop()
+        ins.write_json_atomic(filtered, data)
+        out["master_rows"] = data["master_rows"]
 
-    out: dict[str, Any] = {"master_rows": master_rows, "master_load_seconds": load_s,
-                           "spot_tokens": spot, "indices": {}}
-    if ltp_err:
-        out["ltp_error"] = ltp_err
-    n_side = CFG["oi"]["strikes_each_side"]
-    tokens: dict[str, dict[str, Any]] = {}
-    ok = len(spot) == len(indices)
-    for k, v in indices.items():
-        expiries = sorted({o["expiry"] for o in opts[k]})
-        info: dict[str, Any] = {"option_rows_future": len(opts[k]),
-                                "nearest_expiry": expiries[0].isoformat() if expiries else None,
-                                "next_expiry": expiries[1].isoformat() if len(expiries) > 1 else None,
-                                "expiries_listed": len(expiries)}
-        if not expiries:
-            ok = False
-        elif k in ltp:
-            near = [o for o in opts[k] if o["expiry"] == expiries[0]]
-            strikes = sorted({o["strike"] for o in near})
-            step = v["strike_step"]
-            atm = round(ltp[k] / step) * step
-            if atm not in strikes:  # snap to nearest listed strike
-                atm = min(strikes, key=lambda s: abs(s - ltp[k]))
-            i = strikes.index(atm)
-            sel = strikes[max(0, i - n_side): i + n_side + 1]
-            chosen = [o for o in near if o["strike"] in sel]
-            gaps = sorted({round(b - a, 2) for a, b in zip(sel, sel[1:])})
-            info.update(spot_ltp=ltp[k], atm=atm, strikes_selected=len(sel),
-                        strike_range=[sel[0], sel[-1]], strike_gaps=gaps,
-                        ce_tokens=sum(o["type"] == "CE" for o in chosen),
-                        pe_tokens=sum(o["type"] == "PE" for o in chosen),
-                        sample_symbol=chosen[0]["symbol"] if chosen else None)
-            tokens[k] = {"exchange": v["option_exchange"],
-                         "tokens": [o["token"] for o in chosen],
-                         "meta": {o["token"]: (o["strike"], o["type"]) for o in chosen}}
-            if len(sel) < 2 * n_side + 1:
-                ok = False
-        else:
-            ok = False
-        out["indices"][k] = info
-    STATE["spot"] = spot
-    STATE["opt_tokens"] = tokens
+    out["filtered_file_mb"] = round(filtered.stat().st_size / 1e6, 2)
+    out["rss_peak_mb"] = rss_peak_mb()
+    out["filtered_date"] = data["date"]
+    out["master_spot_rows"] = data["spot"]   # cross-check of config spot tokens
+    ok = True
+    per: dict[str, Any] = {}
+    for k in CFG["indices"]:
+        opts = data["options"].get(k, [])
+        exps = ins.expiries(opts)
+        per[k] = {"option_rows_future": len(opts),
+                  "nearest_expiry": exps[0] if exps else None,
+                  "next_expiry": exps[1] if len(exps) > 1 else None,
+                  "expiries_listed": len(exps),
+                  "spot_token_in_master": k in data["spot"]}
+        ok = ok and bool(exps)
+    out["indices"] = per
     if not ok:
         out["_status"] = "PARTIAL"
     return out
 
 
 # ---------------------------------------------------------------- P3 / P6
+def ensure_option_tokens() -> dict[str, Any]:
+    """Load today's filtered file, get spot LTP (config tokens), select ATM +/- N tokens."""
+    if STATE.get("opt_tokens"):
+        return STATE["opt_info"]
+    need("api")
+    data = ins.load_filtered(ROOT / CFG["instruments"]["filtered_file"], today_ist())
+    if not data:
+        raise SkipCheck("no instruments_filtered.json for today (run P2 / --force-download)")
+    req: dict[str, list[str]] = {}
+    for s in SPOT.values():
+        req.setdefault(s["exchange"], []).append(s["token"])
+    fetched = market_data("LTP", req).get("fetched", [])
+    by_token = {f["symbolToken"]: float(f["ltp"]) for f in fetched}
+    n_side = CFG["oi"]["strikes_each_side"]
+    tokens: dict[str, dict[str, Any]] = {}
+    info: dict[str, Any] = {}
+    for k, v in CFG["indices"].items():
+        ltp = by_token.get(SPOT[k]["token"])
+        if ltp is None:
+            info[k] = {"error": "no spot LTP"}
+            continue
+        sel = ins.select_atm_options(data["options"].get(k, []), ltp, v["strike_step"], n_side)
+        st = sel["strikes"]
+        info[k] = {"spot_ltp": ltp, "atm": sel["atm"], "expiry": sel["expiry"],
+                   "strikes_selected": len(st), "strike_range": [st[0], st[-1]] if st else None,
+                   "ce_tokens": sum(o["type"] == "CE" for o in sel["rows"]),
+                   "pe_tokens": sum(o["type"] == "PE" for o in sel["rows"])}
+        if sel["rows"]:
+            tokens[k] = {"exchange": v["option_exchange"], "tokens": [o["token"] for o in sel["rows"]]}
+    STATE["opt_tokens"], STATE["opt_info"] = tokens, info
+    if not tokens:
+        raise RuntimeError(f"no option tokens selected: {info}")
+    return info
+
+
 def poll_oi(index_keys: list[str]) -> dict[str, Any]:
     """Fetch FULL quotes for option tokens of the given indices in batches; return stats."""
     bs = CFG["oi"]["quote_batch_size"]
@@ -263,8 +241,7 @@ def poll_oi(index_keys: list[str]) -> dict[str, Any]:
             except Exception as e:  # noqa: BLE001
                 errors.append(scrub(e))
             batch_secs.append(round(time.monotonic() - t, 2))
-        oi_vals = [f.get("opnInterest") for f in fetched]
-        nonnull = [x for x in oi_vals if x is not None]
+        nonnull = [x for x in (f.get("opnInterest") for f in fetched) if x is not None]
         stats[k] = {"tokens": len(entry["tokens"]), "fetched": len(fetched), "unfetched": unfetched,
                     "oi_nonnull": len(nonnull), "oi_positive": sum(1 for x in nonnull if x and x > 0),
                     "batches": len(batch_secs), "seconds_per_batch": batch_secs,
@@ -278,11 +255,11 @@ def poll_oi(index_keys: list[str]) -> dict[str, Any]:
 
 
 def p3_oi() -> dict[str, Any]:
-    need("api", "opt_tokens")
+    info = ensure_option_tokens()
     stats = poll_oi(list(STATE["opt_tokens"]))
     bad = [k for k, s in stats.items() if s["oi_nonnull"] == 0 or s["errors"]]
     missing = [k for k in CFG["indices"] if k not in stats]
-    out: dict[str, Any] = {"per_index": stats}
+    out: dict[str, Any] = {"selection": info, "per_index": stats}
     if missing:
         out["indices_without_tokens"] = missing
     if bad or missing:
@@ -291,31 +268,39 @@ def p3_oi() -> dict[str, Any]:
 
 
 def p6_full_poll() -> dict[str, Any]:
-    need("api", "opt_tokens")
+    ensure_option_tokens()
     t = time.monotonic()
     stats = poll_oi(list(STATE["opt_tokens"]))
     total = round(time.monotonic() - t, 2)
-    n = sum(s["tokens"] for s in stats.values())
     errs = sum(len(s["errors"]) for s in stats.values())
-    return {"total_seconds": total, "tokens": n, "requests": sum(s["batches"] for s in stats.values()),
-            "errors": errs, "oi_poll_seconds": CFG["oi"]["oi_poll_seconds"],
+    return {"total_seconds": total, "tokens": sum(s["tokens"] for s in stats.values()),
+            "requests": sum(s["batches"] for s in stats.values()), "errors": errs,
+            "oi_poll_seconds": CFG["oi"]["oi_poll_seconds"],
             "expiry_day_estimate_seconds": round(total * 2, 2),
             **({"_status": "PARTIAL"} if errs else {})}
 
 
 # ---------------------------------------------------------------- P4
 def p4_history() -> dict[str, Any]:
-    need("api", "spot")
+    need("api")
     days = CFG["ema"]["seed_trading_days"]
     end = now_ist()
     start = end - timedelta(days=CFG["probe"]["history_calendar_days"])
     out: dict[str, Any] = {}
     ok = True
-    for k, s in STATE["spot"].items():
+    pcfg = CFG["probe"]
+    for k, s in SPOT.items():
+        params = {"exchange": s["exchange"], "symboltoken": s["token"], "interval": "FIFTEEN_MINUTE",
+                  "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": end.strftime("%Y-%m-%d %H:%M")}
         try:
-            resp = STATE["api"].getCandleData({
-                "exchange": s["exchange"], "symboltoken": s["token"], "interval": "FIFTEEN_MINUTE",
-                "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": end.strftime("%Y-%m-%d %H:%M")})
+            try:
+                resp = STATE["api"].getCandleData(params)
+            except Exception as e:  # noqa: BLE001 - SDK raises on rate-limit (non-JSON) replies
+                if "access rate" not in str(e).lower():
+                    raise
+                out.setdefault("rate_limit_retries", []).append(k)
+                time.sleep(pcfg["history_retry_backoff_seconds"])
+                resp = STATE["api"].getCandleData(params)
             if not resp or not resp.get("status"):
                 raise RuntimeError(f"{(resp or {}).get('errorcode', '')} "
                                    f"{scrub((resp or {}).get('message', 'no response'))}")
@@ -333,7 +318,7 @@ def p4_history() -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             out[k] = {"error": scrub(e)}
             ok = False
-        time.sleep(0.4)  # historical API rate limit ~3 req/s
+        time.sleep(pcfg["history_request_gap_seconds"])
     if not ok:
         out["_status"] = "PARTIAL"
     return out
@@ -343,16 +328,16 @@ def p4_history() -> dict[str, Any]:
 def p5_websocket() -> dict[str, Any]:
     if not is_market_open(CFG):
         raise SkipCheck("market closed")
-    need("api", "spot", "feed")
+    need("api", "feed")
     from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
     secs = CFG["probe"]["ws_seconds"]
-    tok_to_key = {s["token"]: k for k, s in STATE["spot"].items()}
-    ticks: dict[str, list[float]] = {k: [] for k in tok_to_key.values()}
+    tok_to_key = {s["token"]: k for k, s in SPOT.items()}
+    ticks: dict[str, list[float]] = {k: [] for k in SPOT}
     errors: list[str] = []
     ws = SmartWebSocketV2(STATE["jwt"], ENV["ANGEL_API_KEY"], ENV["ANGEL_CLIENT_CODE"], STATE["feed"])
     token_list: dict[int, list[str]] = {}
-    for s in STATE["spot"].values():
+    for s in SPOT.values():
         token_list.setdefault(WS_EXCHANGE_TYPE[s["exchange"]], []).append(s["token"])
 
     def on_open(_wsapp):
@@ -388,7 +373,11 @@ def p5_websocket() -> dict[str, Any]:
 
 # ---------------------------------------------------------------- main
 def main() -> int:
-    global ENV
+    global ENV, ARGS
+    ap = argparse.ArgumentParser(description="Angel SmartAPI capability probe")
+    ap.add_argument("--force-download", action="store_true",
+                    help="re-download the scrip master even if today's filtered file exists")
+    ARGS = ap.parse_args()
     ENV = load_env()
     miss = missing_env(ENV, ANGEL_KEYS)
     if miss:
@@ -397,16 +386,18 @@ def main() -> int:
         return 2
 
     started = now_ist()
-    print(f"MarketAlert probe {started:%Y-%m-%d %H:%M:%S} IST (market open: {is_market_open(CFG)})")
+    print(f"MarketAlert probe {started:%Y-%m-%d %H:%M:%S} IST (market open: {is_market_open(CFG)}, "
+          f"cap {CFG['probe']['max_total_seconds']}s)")
     run_check("P1_login", p1_login, 30)
-    run_check("P2_instruments", p2_instruments, 90)
-    run_check("P3_oi_quotes", p3_oi, 45)
     run_check("P4_history_15m", p4_history, 30)
     run_check("P5_websocket", p5_websocket, CFG["probe"]["ws_seconds"] + 15)
+    run_check("P2_instruments", p2_instruments, CFG["probe"]["p2_timeout_seconds"])
+    run_check("P3_oi_quotes", p3_oi, 45)
     run_check("P6_full_oi_poll", p6_full_poll, 45)
 
     report = {"generated_ist": started.isoformat(), "total_seconds": round(time.monotonic() - T0, 1),
-              "market_open": is_market_open(CFG, started), "checks": RESULTS}
+              "market_open": is_market_open(CFG, started), "rss_peak_mb": rss_peak_mb(),
+              "checks": RESULTS}
     out = ROOT / CFG["paths"]["reports_dir"] / "M0_probe.json"
     out.parent.mkdir(exist_ok=True)
     out.write_text(scrub_json(report), encoding="utf-8")

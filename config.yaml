@@ -10,6 +10,7 @@ utc_offset_minutes: 330          # IST = UTC+05:30, used to compute IST explicit
 indices:
   NIFTY:
     spot_symbol: "Nifty 50"
+    spot_token: "99926000"          # fixed index token (no master needed)
     spot_exchange: NSE
     option_name: NIFTY
     option_exchange: NFO
@@ -20,6 +21,7 @@ indices:
     breakout_buffer: 5
   BANKNIFTY:
     spot_symbol: "Nifty Bank"
+    spot_token: "99926009"          # fixed index token (no master needed)
     spot_exchange: NSE
     option_name: BANKNIFTY
     option_exchange: NFO
@@ -30,6 +32,7 @@ indices:
     breakout_buffer: 15
   SENSEX:
     spot_symbol: "SENSEX"
+    spot_token: "99919000"          # fixed index token (no master needed)
     spot_exchange: BSE
     option_name: SENSEX
     option_exchange: BFO
@@ -42,7 +45,11 @@ indices:
 # --- Instruments --------------------------------------------------------------
 instruments:
   master_url: "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-  download_timeout_seconds: 60
+  download_timeout_seconds: 120  # per-read timeout while streaming
+  download_chunk_bytes: 262144   # stream to disk in 256 KB chunks
+  parse_chunk_chars: 1048576     # streaming JSON parse buffer
+  master_file: data/scrip_master.json
+  filtered_file: data/instruments_filtered.json
   strike_divisor: 100            # master stores strike * 100
 
 # --- OI / walls (Sections 5, 6, 7) ---------------------------------------------
@@ -112,7 +119,10 @@ paths:
 
 # --- Probe (M0) ------------------------------------------------------------------
 probe:
-  max_total_seconds: 170
+  max_total_seconds: 420         # phone run; P2 alone may take minutes
   check_timeout_seconds: 60
+  p2_timeout_seconds: 300
   ws_seconds: 20
   history_calendar_days: 25      # fetch window; trimmed to the last seed_trading_days
+  history_request_gap_seconds: 1.0   # historical API rate limit (0.4 s was too fast)
+  history_retry_backoff_seconds: 2.0  # one retry after a rate-limit error
