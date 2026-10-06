@@ -167,6 +167,7 @@ def p2_instruments() -> dict[str, Any]:
         tracemalloc.stop()
         ins.write_json_atomic(filtered, data)
         out["master_rows"] = data["master_rows"]
+        out["skipped_option_rows"] = data["skipped_option_rows"]
 
     out["filtered_file_mb"] = round(filtered.stat().st_size / 1e6, 2)
     out["rss_peak_mb"] = rss_peak_mb()
@@ -281,6 +282,22 @@ def p6_full_poll() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- P4
+def get_candles(params: dict[str, str], key: str, out: dict[str, Any]) -> dict[str, Any]:
+    """getCandleData with backoff retries on rate-limit errors (SDK raises on those replies)."""
+    h = CFG["history"]
+    delay = h["retry_backoff_seconds"]
+    for attempt in range(h["retries"] + 1):
+        try:
+            return STATE["api"].getCandleData(params)
+        except Exception as e:  # noqa: BLE001
+            if "access rate" not in str(e).lower() or attempt == h["retries"]:
+                raise
+            out.setdefault("rate_limit_retries", []).append(key)
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError("unreachable")
+
+
 def p4_history() -> dict[str, Any]:
     need("api")
     days = CFG["ema"]["seed_trading_days"]
@@ -288,19 +305,11 @@ def p4_history() -> dict[str, Any]:
     start = end - timedelta(days=CFG["probe"]["history_calendar_days"])
     out: dict[str, Any] = {}
     ok = True
-    pcfg = CFG["probe"]
     for k, s in SPOT.items():
         params = {"exchange": s["exchange"], "symboltoken": s["token"], "interval": "FIFTEEN_MINUTE",
                   "fromdate": start.strftime("%Y-%m-%d %H:%M"), "todate": end.strftime("%Y-%m-%d %H:%M")}
         try:
-            try:
-                resp = STATE["api"].getCandleData(params)
-            except Exception as e:  # noqa: BLE001 - SDK raises on rate-limit (non-JSON) replies
-                if "access rate" not in str(e).lower():
-                    raise
-                out.setdefault("rate_limit_retries", []).append(k)
-                time.sleep(pcfg["history_retry_backoff_seconds"])
-                resp = STATE["api"].getCandleData(params)
+            resp = get_candles(params, k, out)
             if not resp or not resp.get("status"):
                 raise RuntimeError(f"{(resp or {}).get('errorcode', '')} "
                                    f"{scrub((resp or {}).get('message', 'no response'))}")
@@ -318,7 +327,7 @@ def p4_history() -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             out[k] = {"error": scrub(e)}
             ok = False
-        time.sleep(pcfg["history_request_gap_seconds"])
+        time.sleep(CFG["history"]["request_gap_seconds"])
     if not ok:
         out["_status"] = "PARTIAL"
     return out
@@ -335,7 +344,10 @@ def p5_websocket() -> dict[str, Any]:
     tok_to_key = {s["token"]: k for k, s in SPOT.items()}
     ticks: dict[str, list[float]] = {k: [] for k in SPOT}
     errors: list[str] = []
-    ws = SmartWebSocketV2(STATE["jwt"], ENV["ANGEL_API_KEY"], ENV["ANGEL_CLIENT_CODE"], STATE["feed"])
+    wcfg = CFG["websocket"]
+    ws = SmartWebSocketV2(STATE["jwt"], ENV["ANGEL_API_KEY"], ENV["ANGEL_CLIENT_CODE"], STATE["feed"],
+                          max_retry_attempt=wcfg["sdk_max_retry_attempts"],
+                          retry_delay=wcfg["sdk_retry_delay_seconds"])
     token_list: dict[int, list[str]] = {}
     for s in SPOT.values():
         token_list.setdefault(WS_EXCHANGE_TYPE[s["exchange"]], []).append(s["token"])
@@ -362,6 +374,7 @@ def p5_websocket() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     out: dict[str, Any] = {"listen_seconds": secs, "errors": errors[:5],
+                           "reconnect_attempts": getattr(ws, "current_retry_attempt", None),
                            "last_ltp": STATE.get("last_ws_ltp", {})}
     for k, ts in ticks.items():
         gaps = [b - a for a, b in zip(ts, ts[1:])]
@@ -389,9 +402,9 @@ def main() -> int:
     print(f"MarketAlert probe {started:%Y-%m-%d %H:%M:%S} IST (market open: {is_market_open(CFG)}, "
           f"cap {CFG['probe']['max_total_seconds']}s)")
     run_check("P1_login", p1_login, 30)
-    run_check("P4_history_15m", p4_history, 30)
+    run_check("P4_history_15m", p4_history, 75)
     run_check("P5_websocket", p5_websocket, CFG["probe"]["ws_seconds"] + 15)
-    run_check("P2_instruments", p2_instruments, CFG["probe"]["p2_timeout_seconds"])
+    run_check("P2_instruments", p2_instruments, CFG["instruments"]["refresh_timeout_seconds"])
     run_check("P3_oi_quotes", p3_oi, 45)
     run_check("P6_full_oi_poll", p6_full_poll, 45)
 

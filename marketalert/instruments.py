@@ -24,6 +24,18 @@ def parse_expiry(s: str) -> date | None:
         return None
 
 
+def option_type(row: dict[str, Any]) -> str | None:
+    """Return 'CE'/'PE' for an option row, else None.
+
+    The master has no option-type field (instrumenttype is 'OPTIDX'), so the trailing two
+    characters of the symbol are the only source. Nothing else is ever parsed from symbols
+    (formats differ, e.g. SENSEX weekly 'SENSEX26O0872500PE'): strike and expiry come from
+    the master's strike/expiry fields.
+    """
+    suffix = str(row.get("symbol", ""))[-2:]
+    return suffix if suffix in ("CE", "PE") else None
+
+
 def write_json_atomic(path: Path, obj: Any) -> None:
     """Write JSON to a temp file then rename over the target."""
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -79,7 +91,7 @@ def build_filtered(master: Path, indices: dict[str, Any], strike_divisor: float,
     spot_want = {(v["spot_exchange"], str(v["spot_token"])): k for k, v in indices.items()}
     spot: dict[str, dict[str, str]] = {}
     options: dict[str, list[dict[str, Any]]] = {k: [] for k in indices}
-    rows = 0
+    rows = skipped = 0
     for row in iter_master_rows(master, chunk_chars):
         rows += 1
         seg = row.get("exch_seg")
@@ -87,14 +99,18 @@ def build_filtered(master: Path, indices: dict[str, Any], strike_divisor: float,
             k = want.get((seg, row.get("name")))
             if k:
                 exp = parse_expiry(row.get("expiry", ""))
-                if exp and exp >= today:
+                otype = option_type(row)
+                if not exp or otype is None:
+                    skipped += 1
+                elif exp >= today:
                     options[k].append({"token": row["token"], "symbol": row["symbol"],
                                        "expiry": exp.isoformat(),
                                        "strike": float(row["strike"]) / strike_divisor,
-                                       "type": row["symbol"][-2:]})
+                                       "type": otype})
         elif (seg, row.get("token")) in spot_want:
             spot[spot_want[(seg, row["token"])]] = {"token": row["token"], "symbol": row.get("symbol")}
-    return {"date": today.isoformat(), "master_rows": rows, "spot": spot, "options": options}
+    return {"date": today.isoformat(), "master_rows": rows, "skipped_option_rows": skipped,
+            "spot": spot, "options": options}
 
 
 def load_filtered(path: Path, today: date) -> dict[str, Any] | None:

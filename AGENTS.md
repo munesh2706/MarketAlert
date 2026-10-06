@@ -150,3 +150,30 @@ Status: DONE | PARTIAL | BLOCKED
 ## 13. Credentials (.env)
 
 ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_MPIN, ANGEL_TOTP_SECRET, TG_BOT_TOKEN, TG_CHAT_ID
+
+## 14. Probe findings (M0, binding)
+
+Measured 2026-10-06 (PC and phone/Termux). Values live in `config.yaml`.
+
+- SENSEX BFO OI is available (62/62 tokens). All 3 indices use the same OI path.
+- Full OI poll of 3 indices (186 tokens, 6 requests): PC 2.8–3.5 s, phone 10.1 s. Fits the 180 s
+  interval easily, including expiry days (about 2×).
+- Instrument refresh on phone: 18.6 s with `--force-download`. The refresh (streamed download +
+  streaming parse into `data/instruments_filtered.json`) must tolerate up to 5 min
+  (`instruments.refresh_timeout_seconds`) and must **run as a separate short-lived process**,
+  never inside the long-running bot process. The bot only reads the filtered file.
+- Spot index tokens are fixed in config (`indices.*.spot_token`); history and websocket never
+  depend on the instrument master.
+- Option instruments: strike = master `strike` / 100, expiry = master `expiry`. Never parse
+  strike or expiry from trading symbols (formats differ, e.g. SENSEX weekly
+  `SENSEX26O0872500PE`). The master has no CE/PE field (`instrumenttype` is `OPTIDX`), so the
+  symbol's last two characters are the only allowed symbol use, validated as `CE`/`PE`
+  (`instruments.option_type`); rows that fail are dropped and counted.
+- Historical candles are rate limited (hit on PC at 0.4 s spacing and on phone). Seed indices
+  **sequentially**, ≥ 1.5 s apart, retry up to 3 times with backoff. If an index still fails, start
+  without its EMA (no EMA alerts for it), log it, and retry seeding every 5 min. Never crash.
+- WebSocket: one reconnect attempt was logged on PC and the feed recovered. Keep auto-reconnect and
+  log reconnect counts. The SDK's internal retry is bounded and its counter never resets, so the
+  bot needs its own outer reconnect loop with backoff (`websocket:` config) on top of the REST
+  fallback from Section 6.
+- SENSEX ticks are sparser (~1 per 1–3 s) than NSE indices; fine for 5/15-min candles.
